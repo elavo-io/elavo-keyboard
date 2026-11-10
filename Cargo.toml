@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/elavo-keyboard-widget",
+    "crates/elavo-keyboard",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/elavo-io/elavo-keyboard"
+
+[workspace.dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+gtk4-layer-shell = "0.8"
+wayland-client = { version = "0.31", features = ["system"] }
+# dlopen keeps libwayland-client out of the binary's link list. When it is
+# linked ahead of libgtk4-layer-shell, layer surfaces silently fail.
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-scanner = "0.31.7"
+libc = "0.2"
+elavo-keyboard-widget = { path = "crates/elavo-keyboard-widget" }
+
+[profile.release]
+lto = "thin"
+strip = true

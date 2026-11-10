@@ -1,0 +1,10 @@
+[package]
+name = "elavo-keyboard-widget"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Elavo on-screen keyboard as a GTK4 widget"
+
+[dependencies]
+gtk.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "elavo-keyboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Elavo on-screen keyboard daemon for labwc"
+
+[dependencies]
+gtk.workspace = true
+gtk4-layer-shell.workspace = true
+wayland-client.workspace = true
+wayland-backend.workspace = true
+wayland-protocols.workspace = true
+wayland-scanner.workspace = true
+libc.workspace = true
+async-channel = "2"
+elavo-keyboard-widget.workspace = true
+
+[dev-dependencies]
+# Only for the tap-pointer example the test scripts use.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
