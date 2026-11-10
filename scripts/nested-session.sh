@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run the keyboard in a separate, headless labwc so the real session (and
-# its elavo-input) is left alone.
+# its input method) is left alone.
 #
 #   scripts/nested-session.sh start     labwc on a new socket, 1366x768
 #   scripts/nested-session.sh keyboard  start elavo-keyboard in it
@@ -9,7 +9,14 @@
 #   scripts/nested-session.sh tap ID... tap keys by id (q, shift, space, backspace, return, hide, page-numbers)
 #   scripts/nested-session.sh click X Y [HOLD_MS]  press a screen point
 #   scripts/nested-session.sh hold ID MS hold one key down for MS milliseconds
+#   scripts/nested-session.sh press KEY... physical keys with real key codes (h i space space backspace)
+#   scripts/nested-session.sh mode M    write Mode=M (automatic, always, never) to the test config
 #   scripts/nested-session.sh stop      end it all
+#
+# The keyboard reads its settings from $T/config/elavo, not yours. Every
+# click also bumps a fake touchscreen interrupt count in $T/interrupts, which
+# the keyboard reads instead of /proc/interrupts, so Automatic sees a touch.
+# NO_KEYBOARD=1 before `keyboard` makes it see no physical keyboard.
 #
 # Programs run inside the elavo-dev toolbox, where they were built.
 # Nothing here needs root.
@@ -58,7 +65,20 @@ XML
     echo "nested labwc on $S at $MODE (pid $(cat "$T/labwc.pid"))"
     ;;
 keyboard)
+    mkdir -p "$T/config/elavo"
+    # A fake touchscreen on IRQ 31, and the devices it would be found in.
+    printf '           CPU0\n  31:          0  IR-IO-APIC 31-fasteoi   TEST0001:00\n' >"$T/interrupts"
+    {
+        [ -n "${NO_KEYBOARD:-}" ] || printf '%s\n' 'N: Name="Test keyboard"' \
+            'S: Sysfs=/devices/platform/i8042/serio0/input/input3' 'B: PROP=0' 'B: EV=120013' \
+            'B: KEY=402000000 3803078f800d001 feffffdfffcfffff fffffffffffffffe' ''
+        printf '%s\n' 'N: Name="Test touchscreen"' \
+            'S: Sysfs=/devices/i2c-1/i2c-TEST0001:00/0018:0000:0000.0001/input/input9' \
+            'B: PROP=2' 'B: EV=1b' ''
+    } >"$T/input-devices"
     in_box env ELAVO_KEYBOARD_LOG=1 ELAVO_KEYBOARD_KEYS_FILE="$T/keys" \
+        XDG_CONFIG_HOME="$T/config" ELAVO_KEYBOARD_INTERRUPTS="$T/interrupts" \
+        ELAVO_KEYBOARD_INPUT_DEVICES="$T/input-devices" \
         "$ROOT/target/debug/elavo-keyboard" >"$T/keyboard.log" 2>&1 &
     sleep 1.5
     cat "$T/keyboard.log"
@@ -74,6 +94,10 @@ shot)
     echo "$out"
     ;;
 click)
+    if [ -f "$T/interrupts" ]; then
+        n=$(awk '$1 == "31:" {print $2}' "$T/interrupts")
+        sed -i "s/^  31: *[0-9]*/  31:          $((n + 3))/" "$T/interrupts"
+    fi
     in_box "$ROOT/target/debug/examples/tap-pointer" "$2" "$3" "${4:-40}" ${MODE/x/ }
     ;;
 hold)
@@ -108,6 +132,15 @@ taps)
     done
     in_box sh -c "$cmd"
     ;;
+press)
+    shift
+    in_box "$ROOT/target/debug/examples/press-keys" "$@"
+    ;;
+mode)
+    mkdir -p "$T/config/elavo"
+    printf '[OnScreenKeyboard]\nMode=%s\nSize=%s\n' "$2" "${3:-standard}" \
+        >"$T/config/elavo/onscreen-keyboard.conf"
+    ;;
 stop)
     pkill -f "$ROOT/target/debug/elavo-keyboard" || true
     pkill -f "$ROOT/target/debug/examples/test-entry" || true
@@ -115,7 +148,7 @@ stop)
     rm -f "$T/socket" "$T/labwc.pid"
     ;;
 *)
-    sed -n '2,15p' "$0"
+    sed -n '2,23p' "$0"
     exit 1
     ;;
 esac

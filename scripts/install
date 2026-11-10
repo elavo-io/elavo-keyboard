@@ -1,0 +1,13 @@
+#!/bin/sh
+# Install a release build. Run `cargo build --release` first.
+# Honors DESTDIR and PREFIX (default /usr). The Elavo image build calls this.
+set -eu
+
+cd "$(dirname "$0")/.."
+prefix="${PREFIX:-/usr}"
+dest="${DESTDIR:-}"
+
+install -Dm755 target/release/elavo-keyboard "${dest}${prefix}/bin/elavo-keyboard"
+install -Dm644 data/systemd/user/elavo-keyboard.service \
+    "${dest}${prefix}/lib/systemd/user/elavo-keyboard.service"
+install -Dm644 LICENSE.md "${dest}${prefix}/share/licenses/elavo-keyboard/LICENSE.md"

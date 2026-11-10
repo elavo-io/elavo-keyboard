@@ -31,7 +31,7 @@ pub enum Action {
     Hide,
 }
 
-/// Keyboard height classes. Settings will offer these later.
+/// Keyboard height classes, offered in the Touchscreen pane of System Settings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Size {
     Compact,

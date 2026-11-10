@@ -1,35 +1,57 @@
-//! elavo-keyboard: the on-screen keyboard daemon.
+//! elavo-keyboard: the on-screen keyboard daemon, and the session's input
+//! method.
 //!
 //! It holds the seat's input method, shows the keyboard in a bottom layer
 //! surface when a text field takes focus, and hides it when focus leaves.
+//! It also adds a period on double-space for physical and on-screen keys,
+//! which Folio's `elavo-input` did before.
+//!
+//! When the keyboard shows is the `Mode` in `onscreen-keyboard.conf`
+//! (see `config`). Automatic shows it for a field focused just after a
+//! touchscreen tap, unless a physical key was pressed since, and hides it
+//! when a physical key is pressed. With no physical keyboard attached it
+//! shows for every field.
 //!
 //! ```text
 //! elavo-keyboard            run (labwc allows one input method per seat)
 //! ELAVO_KEYBOARD_LOG=1      log activate, deactivate and every edit to stderr
-//! ELAVO_KEYBOARD_SIZE=large compact, standard or large
+//! ELAVO_KEYBOARD_MODE=always
+//!                           automatic, always or never, over the file
+//! ELAVO_KEYBOARD_SIZE=large compact, standard or large, over the file
 //! ELAVO_KEYBOARD_KEYS_FILE=/path
 //!                           after each show, write "id x y" screen centers
 //!                           of every key, for the test scripts
 //! ```
 
 mod config;
+mod devices;
 mod im;
+mod period;
 mod protocol;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use elavo_keyboard_widget::{Action, Keyboard};
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
+use crate::config::Mode;
+use crate::devices::TouchWatch;
 use crate::im::{keys, Command, Commands, UiEvent};
 
 /// Focus moving from one field to the next deactivates and activates in
 /// quick succession. Waiting this long before hiding avoids a flicker.
 const HIDE_DELAY: Duration = Duration::from_millis(120);
+
+/// In Automatic, a field focused this soon after a touchscreen contact
+/// counts as tapped.
+const TOUCH_WINDOW: Duration = Duration::from_millis(1500);
+
+/// How often Automatic samples the touchscreen's interrupt count.
+const TOUCH_POLL: Duration = Duration::from_millis(200);
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder()
@@ -57,12 +79,19 @@ struct Daemon {
     commands: Commands,
     hide_timer: Rc<RefCell<Option<glib::SourceId>>>,
     height: Cell<i32>,
+    config: Cell<config::Config>,
+    /// A text field has focus.
+    focused: Cell<bool>,
+    touch: RefCell<TouchWatch>,
+    touch_poll: RefCell<Option<glib::SourceId>>,
+    last_key: Cell<Option<Instant>>,
     log: bool,
 }
 
 fn start(app: &gtk::Application) {
     let log = std::env::var_os("ELAVO_KEYBOARD_LOG").is_some_and(|v| !v.is_empty() && v != "0");
-    let (commands, events) = match im::spawn(log) {
+    let config = config::load();
+    let (commands, events) = match im::spawn(log, config) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("elavo-keyboard: {e}");
@@ -73,7 +102,6 @@ fn start(app: &gtk::Application) {
     // There is no window until a field takes focus; keep running anyway.
     std::mem::forget(app.hold());
 
-    let config = config::load();
     let (_, screen_h) = monitor_size();
     let height = config.size.height_for(screen_h);
 
@@ -100,11 +128,20 @@ fn start(app: &gtk::Application) {
         commands,
         hide_timer: Rc::default(),
         height: Cell::new(height),
+        config: Cell::new(config),
+        focused: Cell::new(false),
+        touch: RefCell::default(),
+        touch_poll: RefCell::default(),
+        last_key: Cell::new(None),
         log,
     });
     if log {
-        eprintln!("elavo-keyboard: ready, {height} px for a {screen_h} px screen");
+        eprintln!(
+            "elavo-keyboard: ready, {:?}, {height} px for a {screen_h} px screen",
+            config.mode
+        );
     }
+    daemon.update_touch_poll();
 
     let weak = Rc::downgrade(&daemon);
     daemon.keyboard.connect_action(move |action| {
@@ -153,7 +190,7 @@ fn start(app: &gtk::Application) {
 }
 
 impl Daemon {
-    fn on_event(&self, event: UiEvent) {
+    fn on_event(self: &Rc<Self>, event: UiEvent) {
         if self.log {
             eprintln!(
                 "elavo-keyboard: ui {event:?}, visible={}",
@@ -162,14 +199,123 @@ impl Daemon {
         }
         match event {
             UiEvent::Show { .. } => {
-                self.cancel_hide();
-                if !self.window.is_visible() {
-                    self.keyboard.reset();
-                    self.window.set_visible(true);
+                self.focused.set(true);
+                if self.wants_to_show() {
+                    self.show();
+                } else {
+                    // A field without the keyboard; drop any pending show.
+                    self.cancel_hide();
+                    self.window.set_visible(false);
                 }
             }
-            UiEvent::Hide => self.schedule_hide(),
+            UiEvent::Hide => {
+                self.focused.set(false);
+                self.schedule_hide();
+            }
+            UiEvent::PhysicalKey => {
+                self.last_key.set(Some(Instant::now()));
+                if self.config.get().mode == Mode::Automatic && self.window.is_visible() {
+                    self.cancel_hide();
+                    self.window.set_visible(false);
+                }
+            }
+            UiEvent::Config(config) => self.apply_config(config),
             UiEvent::Unavailable => {}
+        }
+    }
+
+    /// Whether a field that just took focus gets the keyboard.
+    fn wants_to_show(&self) -> bool {
+        match self.config.get().mode {
+            Mode::Never => false,
+            Mode::Always => true,
+            Mode::Automatic => {
+                let found = devices::scan();
+                let mut touch = self.touch.borrow_mut();
+                touch.set_names(found.touch_irqs);
+                touch.sample();
+                if !found.keyboard {
+                    self.note("no physical keyboard attached");
+                    return true;
+                }
+                let Some(touched) = touch.touched_within(TOUCH_WINDOW) else {
+                    self.note("no recent touch");
+                    return false;
+                };
+                let typed_since = self.last_key.get().is_some_and(|key| key > touched);
+                if typed_since {
+                    self.note("a physical key came after the last touch");
+                }
+                !typed_since
+            }
+        }
+    }
+
+    fn show(&self) {
+        self.cancel_hide();
+        if !self.window.is_visible() {
+            self.keyboard.reset();
+            self.window.set_visible(true);
+        }
+    }
+
+    fn apply_config(self: &Rc<Self>, config: config::Config) {
+        let old = self.config.replace(config);
+        if config.size != old.size {
+            let (_, screen_h) = monitor_size();
+            let height = config.size.height_for(screen_h);
+            self.height.set(height);
+            self.keyboard.set_height(height);
+            self.window.set_exclusive_zone(height);
+        }
+        if config.mode != old.mode {
+            match config.mode {
+                Mode::Never => {
+                    self.cancel_hide();
+                    self.window.set_visible(false);
+                }
+                Mode::Always if self.focused.get() => self.show(),
+                _ => {}
+            }
+            self.update_touch_poll();
+        }
+    }
+
+    /// Sample the touchscreen only while Automatic needs it.
+    fn update_touch_poll(self: &Rc<Self>) {
+        let want = self.config.get().mode == Mode::Automatic;
+        let running = self.touch_poll.borrow().is_some();
+        if want == running {
+            return;
+        }
+        if !want {
+            if let Some(id) = self.touch_poll.take() {
+                id.remove();
+            }
+            return;
+        }
+        {
+            let mut touch = self.touch.borrow_mut();
+            touch.set_names(devices::scan().touch_irqs);
+            if !touch.has_touchscreen() {
+                self.note("no I2C touchscreen found; Automatic relies on keyboard presence");
+            }
+            touch.sample();
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local(TOUCH_POLL, move || {
+            let Some(d) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            d.touch.borrow_mut().sample();
+            glib::ControlFlow::Continue
+        });
+        self.touch_poll.replace(Some(id));
+    }
+
+    fn note(&self, msg: &str) {
+        if self.log {
+            eprintln!("elavo-keyboard: {msg}");
         }
     }
 

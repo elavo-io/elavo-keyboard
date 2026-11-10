@@ -1,0 +1,20 @@
+[Unit]
+Description=Elavo on-screen keyboard and text input
+Documentation=https://github.com/elavo-io/elavo-keyboard
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+ConditionEnvironment=XDG_CURRENT_DESKTOP=elavo
+# labwc allows one input method per seat. This replaces Folio's elavo-input,
+# including its period on double-space.
+Conflicts=elavo-input.service
+After=elavo-input.service
+
+[Service]
+ExecStart=/usr/bin/elavo-keyboard
+Restart=on-failure
+RestartSec=1
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target
